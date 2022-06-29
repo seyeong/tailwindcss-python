@@ -1,0 +1,160 @@
+name: build and publish
+on: [push]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Load cached venv
+        id: cache-poetry-dependencies
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Install depedencies
+        run: poetry install --no-interaction
+        if: steps.cache-poetry-dependencies.outputs.cache-hit != 'true'
+      - name: Run mypy
+        run: |
+          source $VENV
+          mypy \{\{cookiecutter.project_slug\}\}
+      - name: Run black
+        run: |
+          source $VENV
+          black --check $(git ls-files '*.py')
+      - name: Run isort
+        run: |
+          source $VENV
+          isort --check $(git ls-files '*.py')
+      - name: Run pylint
+        run: |
+          source $VENV
+          pylint \{\{cookiecutter.project_slug\}\}/tailwind
+
+  build:
+    needs: lint
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Load cached venv
+        id: cache-poetry-dependencies
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Install depedencies
+        run: poetry install --no-interaction
+        if: steps.cache-poetry-dependencies.outputs.cache-hit != 'true'
+      - name: Set versions
+        id: versions
+        run: |
+          echo ::set-output name=PRE_RELEASE::$(cat ./PRE_RELEASE)
+          echo ::set-output name=TAILWIND_VERSION::$(cat ./TAILWIND_VERSION)
+          echo ::set-output name=MODULE_VERSION::$(cat TAILWIND_VERSION PRE_RELEASE | python -c "import sys; print(''.join(s.strip() for s in sys.stdin))")
+      - name: Cache build ${{ steps.versions.outputs.MODULE_VERSION }}
+        id: cache-build
+        uses: actions/cache@v3
+        with:
+          path: build
+          key: ${{ steps.versions.outputs.MODULE_VERSION }}-build-${{ hashFiles('poetry.lock') }}
+      - name: Build ${{ steps.versions.outputs.MODULE_VERSION }} on ${{ matrix.os }}
+        run: |
+          source $VENV
+          python build.py ${{ steps.versions.outputs.TAILWIND_VERSION }} ${{ steps.versions.outputs.PRE_RELEASE }}
+      - name: Package
+        run: |
+          source $VENV
+          find build/wheel/${{ steps.versions.outputs.MODULE_VERSION }}/tailwind-* -maxdepth 0 -exec bash -c 'basename "$1" && cd "$1" && python setup.py bdist_wheel' - {} \;
+  test:
+    needs: build
+    strategy:
+      matrix:
+        os_arch:
+          - os: ubuntu-latest
+            arch: manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64
+          - os: macos-latest
+            arch: macosx_10_9_x86_64
+          - os: windows-latest
+            arch: win_amd64
+        python-version: ['3.8', '3.9', '3.10']
+    runs-on: ${{ matrix.os_arch.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Set versions
+        id: versions
+        run: |
+          echo ::set-output name=PRE_RELEASE::$(cat ./PRE_RELEASE)
+          echo ::set-output name=TAILWIND_VERSION::$(cat ./TAILWIND_VERSION)
+          echo ::set-output name=MODULE_VERSION::$(cat TAILWIND_VERSION PRE_RELEASE | python -c "import sys; print(''.join(s.strip() for s in sys.stdin))")
+      - name: Cache build ${{ steps.versions.outputs.MODULE_VERSION }}
+        id: cache-build
+        uses: actions/cache@v3
+        with:
+          path: build
+          key: ${{ steps.versions.outputs.MODULE_VERSION }}-build-${{ hashFiles('poetry.lock') }}
+      - name: Install ${{ steps.versions.outputs.MODULE_VERSION }}
+        run: |
+          cd build/wheel/${{ steps.versions.outputs.MODULE_VERSION }}/tailwind-${{ matrix.os_arch.arch }}
+          pip install dist/tailwind*.whl
+      - name: Install pytest
+        run: |
+          pip install pytest==7.1.2
+      - name: Test ${{ steps.versions.outputs.MODULE_VERSION }} on ${{ matrix.os }}
+        run: |
+          pytest
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Set versions
+        id: versions
+        run: |
+          echo ::set-output name=PRE_RELEASE::$(cat ./PRE_RELEASE)
+          echo ::set-output name=TAILWIND_VERSION::$(cat ./TAILWIND_VERSION)
+          echo ::set-output name=MODULE_VERSION::$(cat TAILWIND_VERSION PRE_RELEASE | python -c "import sys; print(''.join(s.strip() for s in sys.stdin))")
+      - name: Cache build ${{ steps.versions.outputs.MODULE_VERSION }}
+        id: cache-build
+        uses: actions/cache@v3
+        with:
+          path: build
+          key: ${{ steps.versions.outputs.MODULE_VERSION }}-build-${{ hashFiles('poetry.lock') }}
+      - name: Install Twine
+        run: |
+          pip install twine
+      - name: Upload
+        run: |
+          find build/wheel/${{ steps.versions.outputs.MODULE_VERSION }}/tailwind-* -maxdepth 0 -exec bash -c 'basename "$1" && cd "$1" && twine upload dist/* --disable-progress-bar -u __token__ -p ${{ secrets.PYPIKEY }}' - {} \;
